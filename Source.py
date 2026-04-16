@@ -6,188 +6,115 @@ from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lsa import LsaSummarizer
 import sqlite3
 from urllib.parse import urljoin
-import os
-import colorama  # ✅ Fix Colors for Windows
+import colorama
+from concurrent.futures import ThreadPoolExecutor
+
 colorama.init()
 
-# ✅ Fix Colors using colorama (Works on all OS)
+# Styling
 RESET = colorama.Style.RESET_ALL
 GREEN = colorama.Fore.GREEN
 YELLOW = colorama.Fore.YELLOW
 CYAN = colorama.Fore.CYAN
 RED = colorama.Fore.RED
 
-# ✅ Correct Google News URL
 BASE_URL = "https://news.google.com/"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"}
 
-# ✅ Function to scrape articles
-def scrape_articles():
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(BASE_URL, headers=headers)
-
-    if response.status_code != 200:
-        print(f"{RED}❌ Failed to retrieve data!{RESET}")
-        return []
-
-    soup = BeautifulSoup(response.text, 'html.parser')
-    articles = []
-
-    for tag in soup.find_all('a', href=True):
-        link = tag['href']
-        if link.startswith("./"):  # ✅ Convert relative URLs to full URLs
-            link = urljoin(BASE_URL, link[1:])  # Remove leading `.`
-        
-        articles.append(link)
-
-    print(f"{GREEN}✅ Total articles found: {len(articles)}{RESET}")
-    return articles
-
-# ✅ Extract article details (title, summary, etc.)
-def extract_article_details(url):
-    try:
-        response = requests.get(url)
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        title = soup.title.string if soup.title else "No Title"
-        text = " ".join(p.text for p in soup.find_all('p'))
-        author = soup.find('meta', attrs={'name': 'author'})
-        author = author['content'] if author else "Unknown"
-        image = soup.find('meta', property='og:image')
-        image_url = image['content'] if image else "No Image Found"
-
-        return title, text, author, image_url
-
-    except Exception as e:
-        print(f"{RED}⚠️ Error fetching article: {url} | {e}{RESET}")
-        return "No Title", "", "Unknown", "No Image Found"
-
-# ✅ Summarize the article
-def summarize_text(text):
-    parser = PlaintextParser.from_string(text, Tokenizer("english"))
-    summarizer = LsaSummarizer()
-    summary = summarizer(parser.document, 2)
-    return " ".join([str(sentence) for sentence in summary])
-
-# ✅ Analyze sentiment
-def analyze_sentiment(text):
-    blob = TextBlob(text)
-    return blob.sentiment.polarity
-
-# ✅ Categorize articles
-def categorize_article(title, text):
-    categories = {
-        "Technology": ["AI", "tech", "software", "computer", "science"],
-        "Politics": ["election", "government", "president", "policy"],
-        "Sports": ["game", "tournament", "player", "team"],
-        "Business": ["stocks", "market", "finance", "economy"],
-        "Health": ["virus", "vaccine", "doctor", "medicine"],
-    }
-
-    for category, keywords in categories.items():
-        for word in keywords:
-            if word.lower() in title.lower() or word.lower() in text.lower():
-                return category
-    return "General"
-
-# ✅ Save data to SQLite
-def save_to_db(title, url, summary, sentiment, author, image_url, category):
+def init_db():
     conn = sqlite3.connect("scraper.db")
     cursor = conn.cursor()
-    
     cursor.execute('''CREATE TABLE IF NOT EXISTS articles 
-                      (title TEXT, url TEXT, summary TEXT, sentiment REAL, 
+                      (title TEXT, url TEXT UNIQUE, summary TEXT, sentiment REAL, 
                        author TEXT, image_url TEXT, category TEXT)''')
-
-    cursor.execute("INSERT INTO articles VALUES (?, ?, ?, ?, ?, ?, ?)", 
-                   (title, url, summary, sentiment, author, image_url, category))
-    
     conn.commit()
     conn.close()
 
-# ✅ View saved articles with clickable links
-def view_saved_articles():
-    conn = sqlite3.connect("scraper.db")
-    cursor = conn.cursor()
+def scrape_article_links():
+    try:
+        response = requests.get(BASE_URL, headers=HEADERS, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Google News uses specific classes for articles; finding all <a> tags is a good fallback
+        links = set()
+        for tag in soup.find_all('a', href=True):
+            href = tag['href']
+            if href.startswith("./articles/"):
+                full_url = urljoin(BASE_URL, href)
+                links.add(full_url)
+        
+        return list(links)
+    except Exception as e:
+        print(f"{RED}❌ Scrape Error: {e}{RESET}")
+        return []
 
-    cursor.execute("SELECT title, url, category FROM articles")
-    articles = cursor.fetchall()
+def process_and_save(url):
+    """Fetches, summarizes, and saves a single article."""
+    try:
+        # 1. Extract
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        title = soup.title.string.split(" - ")[0] if soup.title else "No Title"
+        paragraphs = soup.find_all('p')
+        text = " ".join([p.get_text() for p in paragraphs if len(p.get_text()) > 50])
+        
+        if not text or len(text) < 200: return # Skip thin content
+        
+        # 2. Analyze
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        summarizer = LsaSummarizer()
+        summary = " ".join([str(s) for s in summarizer(parser.document, 2)])
+        sentiment = TextBlob(text).sentiment.polarity
+        
+        # 3. Categorize
+        category = "General"
+        keywords = {
+            "Technology": ["AI", "tech", "software", "google", "apple", "data"],
+            "Politics": ["government", "policy", "court", "election"],
+            "Sports": ["nba", "nfl", "football", "match", "win"],
+            "Finance": ["stocks", "market", "economy", "crypto"]
+        }
+        for cat, words in keywords.items():
+            if any(w in title.lower() or w in text.lower()[:500] for w in words):
+                category = cat
+                break
 
-    if not articles:
-        print(f"{RED}❌ No articles saved yet!{RESET}")
-    else:
-        print(f"{YELLOW}\n📜 Saved Articles:{RESET}")
-        for i, (title, url, category) in enumerate(articles, 1):
-            print(f"{CYAN}{i}. {title} ({category}){RESET}")
-            print(f"   🔗 {GREEN}\033]8;;{url}\033\\{url}\033]8;;\033\\{RESET}")
+        # 4. Save
+        conn = sqlite3.connect("scraper.db")
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO articles VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                       (title, url, summary, sentiment, "Unknown", "N/A", category))
+        conn.commit()
+        conn.close()
+        print(f"{GREEN}✅ Processed: {title[:50]}...{RESET}")
 
-    conn.close()
+    except Exception:
+        pass # Silently skip failed individual articles
 
-# ✅ Search articles by category
-def search_articles_by_category():
-    category = input(f"{YELLOW}🔎 Enter category (Technology, Politics, Sports, Business, Health, General): {RESET}").capitalize()
-
-    conn = sqlite3.connect("scraper.db")
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT title, url FROM articles WHERE category=?", (category,))
-    articles = cursor.fetchall()
-
-    if not articles:
-        print(f"{RED}❌ No articles found in this category!{RESET}")
-    else:
-        print(f"{YELLOW}\n📂 Articles in {category}:{RESET}")
-        for i, (title, url) in enumerate(articles, 1):
-            print(f"{CYAN}{i}. {title}{RESET}")
-            print(f"   🔗 {GREEN}\033]8;;{url}\033\\{url}\033]8;;\033\\{RESET}")
-
-    conn.close()
-
-# ✅ Interactive Menu
 def main():
+    init_db()
     while True:
-        print(f"\n{GREEN}🔹 News Scraper AI Menu:{RESET}")
-        print("1️⃣ Scrape & Save New Articles")
-        print("2️⃣ View Saved Articles")
-        print("3️⃣ Search Articles by Category")
-        print("4️⃣ Exit")
-
-        choice = input(f"{YELLOW}Enter your choice (1-4): {RESET}")
+        print(f"\n{CYAN}--- News Scraper AI ---{RESET}")
+        print("1. Scrape New Articles (Fast Multi-thread)")
+        print("2. View All Saved")
+        print("3. Exit")
+        
+        choice = input(f"{YELLOW}Choice: {RESET}")
 
         if choice == "1":
-            article_links = scrape_articles()
-
-            for link in article_links[:5]:  # ✅ Limit to first 5 articles
-                title, text, author, image_url = extract_article_details(link)
-
-                if text:
-                    summary = summarize_text(text)
-                    sentiment = analyze_sentiment(summary)
-                    category = categorize_article(title, text)
-
-                    save_to_db(title, link, summary, sentiment, author, image_url, category)
-
-                    print(f"\n{GREEN}✅ Article Saved:{RESET}")
-                    print(f"📰 {title}")
-                    print(f"🔗 {GREEN}\033]8;;{link}\033\\{link}\033]8;;\033\\{RESET}")  # ✅ Clickable link
-                    print(f"✍️ {author}")
-                    print(f"🖼️ {image_url}")
-                    print(f"📖 {summary}")
-                    print(f"📊 Sentiment Score: {sentiment:.2f}")
-                    print(f"📌 Category: {category}")
-                    print("-" * 60)
-
+            links = scrape_article_links()
+            print(f"{YELLOW}Found {len(links)} links. Processing top 10...{RESET}")
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                executor.map(process_and_save, links[:10])
         elif choice == "2":
-            view_saved_articles()
-
+            conn = sqlite3.connect("scraper.db")
+            for row in conn.execute("SELECT title, category, url FROM articles"):
+                print(f"📌 {row[1]} | {row[0]}\n   🔗 {row[2]}")
+            conn.close()
         elif choice == "3":
-            search_articles_by_category()
-
-        elif choice == "4":
-            print(f"{RED}🚪 Exiting... Goodbye!{RESET}")
             break
-
-        else:
-            print(f"{RED}⚠️ Invalid choice! Enter a number between 1 and 4.{RESET}")
 
 if __name__ == "__main__":
     main()
