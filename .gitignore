@@ -1,0 +1,13 @@
+# Ignore the local database
+scraper.db
+
+# Ignore Python bytecode
+__pycache__/
+*.pyc
+
+# Ignore environment variables (if you add them later)
+.env
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
